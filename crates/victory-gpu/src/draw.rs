@@ -78,6 +78,8 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Sparse heap blocks a recorded table still reads.
+    view_blocks: Vec<crate::descriptor::host::ViewBlockHold>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -1222,9 +1224,12 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            match host.run(first, last) {
-                Some(at) if at == first => {}
-                Some(at) => {
+            match host.retain_run(first, last) {
+                Some((at, held)) => {
+                    self.view_blocks.extend(held);
+                    if at == first {
+                        continue;
+                    }
                     // The table's entry 0 lies as far below its first used
                     // entry on the host as on the title's heap.
                     let offset = (table - heap.start) as i64 + (i64::from(at) - i64::from(first)) * 32;
@@ -3014,6 +3019,97 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    /// A recorded table may see a cleared slot, but must not see the next
+    /// title block that wants to reuse its physical slot.
+    #[test]
+    fn recorded_sparse_table_cannot_read_a_recycled_block() {
+        let Some(host) = crate::host::host() else { return };
+        if !victory_shader::emit::view_blocks() {
+            return; // this host does not need sparse descriptor blocks
+        }
+        let null = std::ptr::null();
+        let resources = [buffer(1024), buffer(1024)];
+        let heap_desc = [0u32, 1_245_184, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut heap = null;
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let heap_host = title_heap.host().unwrap();
+        let first = 1_200_000;
+        let second = first + (1 << victory_shader::emit::VIEW_BLOCK_SHIFT);
+        let at = |index: u32| title_heap.start + 32 * u64::from(index);
+        let write = |title, resource, value| {
+            let (bytes, _) = crate::resource::buffer_bytes(resource).unwrap();
+            // SAFETY: a word inside our live title buffer.
+            unsafe { bytes.cast::<u32>().write(value) };
+            let address = bytes as u64;
+            let desc = [address as u32, (address >> 32) as u32, 1024, 0];
+            crate::descriptor::create_cbv(null, &desc, at(title));
+            crate::shadow::find(address, 1024).unwrap().update(address as usize, 1024);
+        };
+        write(first, resources[0], 11);
+        let (output, mapped) = host.shared_buffer(256).unwrap();
+        let uav = heap_host.dynamic(1).unwrap();
+        heap_host.raw_view_at(uav, Some(&output), 0, 256, true);
+        let (root, pso) = compile();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, at(first));
+        let used = UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let made = state.tables(&list, &[used], true);
+        assert!(!state.table_failed);
+        let index = made.first().map_or(first, |&(_, offset)| offset / 32);
+        // SAFETY: a live list, signatures, pipeline and heap.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(index));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(uav));
+            list.list.SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+
+        let clear = || {
+            // SAFETY: a record in the title heap of this test.
+            unsafe { (at(first) as *mut [u32; 3]).write([0; 3]) };
+            heap_host.mirror(first, at(first), false);
+        };
+        clear();
+        write(second, resources[1], 99);
+
+        let read = || {
+            host.execute(&[&list]);
+            // SAFETY: the mapped output is live and the GPU has completed.
+            unsafe { mapped.cast::<u32>().read_volatile() }
+        };
+        assert_eq!(read(), 0, "a cleared title view must read zero");
+        write(first, resources[0], 33);
+        assert_eq!(read(), 33, "the table still sees writes to the original title slot");
+        clear();
+        drop(state);
+        assert_eq!(heap_host.run(first, first), None, "the empty block is released with the list");
+        heap_host.make_null(uav);
+        heap_host.release(uav, 1);
+        drop(list);
+        let release = |object| crate::object::slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        assert_eq!(release(heap), 0);
+        for resource in resources {
+            assert_eq!(release(resource), 0);
+        }
     }
 
     /// A table made afresh takes dynamic slots from its first used entry
