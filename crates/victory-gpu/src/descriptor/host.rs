@@ -949,13 +949,29 @@ impl HostHeap {
             (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
         let current = views_current(&records);
         let stale: Vec<u32> = {
+            // Title records use logical indices. The cached keys use the
+            // physical slots the descriptor writes went to.
+            let blocks = self
+                .blocks
+                .as_ref()
+                .map(|blocks| blocks.map.lock().unwrap_or_else(|e| e.into_inner()));
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             (first..last)
                 .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
-                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(&m) => m != 0,
-                    None => true,
+                .filter(|&(i, (&[_, view, generation], current))| {
+                    let slot = match &blocks {
+                        Some(map) => map
+                            .host
+                            .get((i / BLOCK) as usize)
+                            .filter(|&&block| block != NONE)
+                            .map(|&block| block * BLOCK + i % BLOCK),
+                        None => Some(i),
+                    };
+                    match slot.and_then(|slot| made.get(slot as usize)) {
+                        Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
+                        Some(&m) => m != 0,
+                        None => current,
+                    }
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -2505,6 +2521,13 @@ mod tests {
         assert!(heap.mirror(90_001, handle(3), false).is_none());
         let first = heap.slot(90_000).unwrap();
         assert_eq!(first, 90_000 % BLOCK, "the first block taken is the heap's first");
+        // The same record also appears in a different title block, at
+        // the numeric index of the first descriptor's physical slot.
+        heap.sync_slots(first, first + 1, handle(0) - u64::from(first) * 32, 32);
+        let duplicate = heap.slot(first).expect("sync mirrors the second title slot");
+        assert_ne!(duplicate, first);
+        heap.sync_slots(first, first + 1, handle(3) - u64::from(first) * 32, 32);
+        assert_eq!(heap.slot(first), None, "sync removes the second title slot");
         assert_eq!((shader(90_000), stride(first)), (first, 4), "through the heap itself");
         assert_eq!(shader(90_001), first + 1);
         assert_eq!(stride(first + 1), 0, "no view: the shader reads the null buffer view");
