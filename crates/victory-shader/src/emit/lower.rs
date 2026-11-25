@@ -206,6 +206,8 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// Root tables whose final indices go through the view-block map.
+    block_tables: HashSet<usize>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
@@ -536,6 +538,18 @@ impl<'a> Lower<'a> {
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
+        let mut block_tables = HashSet::new();
+        if super::view_blocks() {
+            for &(site, addr) in &x.res.scalar {
+                if x.native.layout.get(addr.param).is_some_and(|p| p.root == RootType::Table)
+                    && (addr.dynamic.is_some()
+                        || x.res.waterfall.loads.contains(&site)
+                        || matches!(p.blocks[site.0].insts[site.1].fields, Fields::Flat { .. }))
+                {
+                    block_tables.insert(addr.param);
+                }
+            }
+        }
         let mut console_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -655,6 +669,7 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
+            block_tables,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -1649,7 +1664,11 @@ impl<'a> Lower<'a> {
             index,
             slot: rp.slot,
             root: rp.root,
-            dword,
+            dword: if dword == 0 && self.block_tables.contains(&param) {
+                super::TABLE_VIEW_BLOCKS
+            } else {
+                dword
+            },
         })
     }
 
@@ -5328,17 +5347,14 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, none, null, index)
     }
 
-    /// The host's heap index for the view heap index `index` that a load
-    /// of a descriptor from a root parameter of type `root` gives, computed
-    /// in the current block. The same index, except for a descriptor from
-    /// the resource heap itself on a host whose view heaps hold the title's
-    /// slots by blocks (module notes, "Heap indices"): there the index is
-    /// the title's, and the host's is the view-block table's entry for its
-    /// block (root SRV [`VIEW_BLOCKS`]) plus the index within the block. A
-    /// table's slots are the host's already: the host passes where the
-    /// table lies.
-    fn host_index(&mut self, root: Option<RootType>, index: V, sampler: bool) -> V {
-        if sampler || root != Some(RootType::ResourceHeap) || !super::view_blocks() {
+    /// Maps a logical index from the resource heap or a computed table
+    /// through the view-block table. Fixed tables and samplers already
+    /// have host indices.
+    fn host_index(&mut self, param: usize, index: V, sampler: bool) -> V {
+        let root = self.x.native.layout[param].root;
+        if sampler || !super::view_blocks()
+            || (root != RootType::ResourceHeap && !self.block_tables.contains(&param))
+        {
             return index;
         }
         let c = self.cur;
@@ -5392,7 +5408,8 @@ impl<'a> Lower<'a> {
         let k = self.s.m.i32(offset.wrapping_add(4 * u32::from(first)));
         let addr = self.s.m.bin(entry, Bin::Add, base, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        self.s.m.bin(entry, Bin::LShr, addr, shift)
+        let index = self.s.m.bin(entry, Bin::LShr, addr, shift);
+        self.host_index(param, index, sampler)
     }
 
     /// The heap index of a descriptor every lane shares, computed in the
@@ -5534,7 +5551,7 @@ impl<'a> Lower<'a> {
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         let index = self.s.m.bin(c, Bin::LShr, at, shift);
-        Ok(self.host_index(root, index, sampler))
+        Ok(self.host_index(a.param, index, sampler))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -5576,7 +5593,7 @@ impl<'a> Lower<'a> {
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         let index = self.s.m.bin(c, Bin::LShr, addr, shift);
-        Ok(self.host_index(root, index, sampler))
+        Ok(self.host_index(a.param, index, sampler))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {

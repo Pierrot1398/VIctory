@@ -752,3 +752,81 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// A table index can cross from one title block into another. The GPU
+/// must read from the physical block of the resulting title index.
+#[test]
+fn computed_table_maps_the_final_texture_index() {
+    let mut code = vec![s_mov_b32(5, ZERO as u8), s_mov_b32(9, ZERO as u8), 0x8F06_8507];
+    let mut load = s_load(3, 12, 4, 0);
+    load[1] = 6 << 25; // s6 = runtime entry s7 times 32 bytes
+    code.extend(load);
+    code.extend(s_load(2, 24, 8, 0)); // fixed output UAV
+    code.push(S_WAITCNT_ALL);
+    code.extend([v_mov_b32(0, ZERO), v_mov_b32(1, ZERO)]);
+    code.extend([0xF000_1F08, 0x0003_0200]); // image_load v[2:5]
+    code.push(S_WAITCNT_ALL);
+    code.extend(buffer_store_dword(2, 24, 0));
+    code.push(S_ENDPGM);
+    let param = |root, user_data, slot| RootParam {
+        root, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data, slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            param(RootType::Table, 4, 0),
+            param(RootType::Constants, 7, 1),
+            param(RootType::Table, 8, 2),
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav, root: RootType::Table, table_offset_dwords: 0,
+            lower_bound: 0, stride: 0, dwords: 4, user_data: 8, slot: 2,
+        }],
+        io: StageIo::Cs(ComputeIo { rsrc2: 9 << 1, threads: [1, 1, 1] }),
+        code: code.into_iter().flat_map(u32::to_le_bytes).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&bytes).unwrap();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    super::shader::TEST_VIEW_HEAP.set(Some((8, true)));
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    super::shader::TEST_VIEW_HEAP.set(None);
+    let shader = shader.unwrap();
+    let block = 1 << super::VIEW_BLOCK_SHIFT;
+    let mut ud = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match u.slot {
+            0 => (2 * block - 1) * 32,
+            1 => 3,
+            _ => 0,
+        };
+    }
+    let wanted = [[0.5f32; 4]];
+    let other = [[0.25f32; 4]];
+    let views: [View<'_>; 8] = std::array::from_fn(|slot| match slot {
+        0 => View::RawUav(4),
+        2 => View::Texture(1, 1, &wanted),
+        _ => View::Texture(1, 1, &other),
+    });
+    let mut ran = false;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let mut roots = vec![(0, Root::Constants(ud.clone()))];
+        if shader.root_srvs.contains(&super::VIEW_BLOCKS) {
+            roots.push((1, Root::View { srv: true, data: vec![0, 4, 0] }));
+        }
+        let out = host.dispatch(
+            &root, &pso, &Dispatch { roots, views: &views, samplers: &[], groups: [1, 1, 1] },
+        ).unwrap();
+        assert_eq!(out[0][0], wanted[0][0].to_bits(), "{label}: texel in the mapped block");
+        ran = true;
+    }
+    assert!(ran, "no SM 6.6 device");
+}
