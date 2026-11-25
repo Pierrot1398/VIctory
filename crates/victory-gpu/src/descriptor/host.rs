@@ -1890,8 +1890,20 @@ mod tests {
         assert_eq!(heap.address_at(first + 1), Some(0), "a view pair");
         // Slots past the dynamic ones (host copies' view pairs) have no
         // entry, and nothing is written past the last: a mark there (the
-        // buffer's allocation reaches past it) stays.
-        assert_eq!(heap.address_at(end), None);
+        // buffer's allocation reaches past it) stays. A heap that holds the
+        // title's slots by blocks (a capped host) has an entry for every
+        // slot of the heap instead, since an index from data can lead to any
+        // block; those past the dynamic ones are never written.
+        // SAFETY: a plain query of a live heap.
+        let slots = match heap.blocks {
+            Some(_) => unsafe { heap.heap.GetDesc() }.NumDescriptors,
+            None => end,
+        };
+        heap.note_address(end, Some(&view));
+        if slots > end {
+            assert_eq!(heap.address_at(end), Some(0), "past the dynamic slots: not written");
+        }
+        assert_eq!(heap.address_at(slots), None);
         let host = host().unwrap();
         let (buffer, data, _) = heap.addresses.get().unwrap().as_ref().unwrap();
         // SAFETY: plain queries of a live buffer.
@@ -1900,13 +1912,13 @@ mod tests {
             let info = host.device.GetResourceAllocationInfo(0, &[desc]);
             (desc, info.SizeInBytes)
         };
-        assert_eq!(desc.Width, 8 * u64::from(end));
+        assert_eq!(desc.Width, 8 * u64::from(slots));
         assert!(size >= desc.Width + 8, "room for the mark");
-        let past = (data + 8 * end as usize) as *mut u64;
+        let past = (data + 8 * slots as usize) as *mut u64;
         let mark = 0x5a5a_5a5a_5a5a_5a5a;
         // SAFETY: mapped memory of the buffer's allocation (checked).
         unsafe { past.write_unaligned(mark) };
-        heap.note_address(end, Some(&view));
+        heap.note_address(slots, Some(&view));
         // SAFETY: as above.
         assert_eq!(unsafe { past.read_unaligned() }, mark);
         // SAFETY: a plain device query.
