@@ -530,7 +530,7 @@ fn copy_overlapping_mips(
             }
             let to_loc = CopyLocation::subresource(to_raw, dst_sub);
             let from_loc = CopyLocation::subresource(from_raw, src_sub);
-            crate::texture::host_written(dst);
+            crate::texture::host_written(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 format!("copy overlapping mip {guest_mip} ({src:?} sub {src_sub} -> {dst:?} sub {dst_sub})")
@@ -573,7 +573,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 copy_overlapping_mips(list, dst, to, hd, src, from, hs);
                 return;
             }
-            crate::texture::host_written(dst);
+            crate::texture::host_written(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -701,7 +701,7 @@ extern "system" fn copy_texture_region(
             from.resource = texture.as_raw().cast_const().cast();
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_written(dst.resource);
+        crate::texture::host_written(list, dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         if dst.kind != FOOTPRINT {
@@ -802,9 +802,10 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        // Before the states: it may record an upload into `dst` first.
+        crate::texture::host_written(list, dst);
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
