@@ -679,7 +679,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.user_data, compute);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -1190,12 +1190,27 @@ impl State {
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        user_data: &[victory_shader::emit::UserData],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        let mapped: Vec<_> = user_data.iter()
+            .filter(|d| d.root == RootType::Table && d.dword == victory_shader::emit::TABLE_VIEW_BLOCKS)
+            .map(|d| d.slot)
+            .collect();
         let mut fresh: Vec<u8> = Vec::new();
         // Each table's title slots the shader reads, first to last.
         let mut spans: Vec<(u8, u64, u32, u32)> = Vec::new();
         for u in used.iter().filter(tables) {
+            if mapped.contains(&u.slot) {
+                // The shader maps the final title index. Known entries
+                // still go through table_entry below.
+                continue;
+            }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
                 continue;
             };

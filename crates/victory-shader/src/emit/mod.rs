@@ -98,10 +98,10 @@
 //!   host's through the view-block table (root SRV `t`[`VIEW_BLOCKS`] in
 //!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`]): dword
 //!   `index >> VIEW_BLOCK_SHIFT` plus the index within the block; a block
-//!   the heap does not hold reads null slots. Descriptor tables need
-//!   nothing: the host passes where a table lies in its own heap, as it
-//!   does for tables it makes afresh. The view-stride table and the view
-//!   addresses are read at the host's index. Translations differ by these
+//!   the heap does not hold reads null slots. Fixed-entry tables use
+//!   the host's offset. A table with a computed entry takes the title's
+//!   offset and looks up the block of each final index. The view-stride
+//!   table and the view addresses use the host's index. Translations differ by these
 //!   two values and by nothing else of the host.
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
@@ -363,6 +363,9 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
+/// [`UserData::dword`] of a table whose reads use logical title indices
+/// through the view-block table. The host passes its title byte offset.
+pub const TABLE_VIEW_BLOCKS: u32 = u32::MAX;
 
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +380,7 @@ pub struct UserData {
     /// Dword within the parameter; for a root descriptor
     /// [`ROOT_SRV_VIEW`], [`ROOT_UAV_VIEW`] or [`ROOT_VIEW_OFFSET`] name
     /// its view's heap index or its offset in that view instead.
+    /// [`TABLE_VIEW_BLOCKS`] selects the title offset of a table.
     pub dword: u32,
 }
 
