@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -186,11 +186,21 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            if let Some(adapter) = best_adapter()
+                && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err()
+            {
+                device = None;
+            }
+            if device.is_none() {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mem = adapter_memory(&device).unwrap_or(0);
+        DEVICE_MEMORY.store(mem, Ordering::Relaxed);
+        tracing::info!(bytes = mem, "host device memory");
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -277,6 +287,85 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
             ));
         }
         Ok(adapter)
+    }
+}
+
+static DEVICE_MEMORY: AtomicU64 = AtomicU64::new(0);
+
+/// Dedicated video memory in bytes of the DXGI adapter the host device runs on
+/// (`0` when DXGI does not report an adapter).
+pub(crate) fn device_memory() -> u64 {
+    DEVICE_MEMORY.load(Ordering::Relaxed)
+}
+
+fn adapter_memory(device: &ID3D12Device) -> Option<u64> {
+    // SAFETY: plain DXGI adapter queries matching the device's adapter LUID.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let luid = device.GetAdapterLuid();
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            if let Ok(desc) = adapter.GetDesc1()
+                && desc.AdapterLuid == luid
+            {
+                return Some(desc.DedicatedVideoMemory as u64);
+            }
+        }
+        None
+    }
+}
+
+fn supports_fl12(adapter: &IDXGIAdapter1) -> bool {
+    // SAFETY: passing a null out-pointer checks D3D12 Feature Level 12.0 support
+    // without instantiating a full device.
+    unsafe {
+        D3D12CreateDevice(
+            adapter,
+            D3D_FEATURE_LEVEL_12_0,
+            std::ptr::null_mut::<Option<ID3D12Device>>(),
+        )
+    }
+    .is_ok()
+}
+
+/// Finds the preferred hardware adapter supporting `D3D_FEATURE_LEVEL_12_0`.
+/// Prefers `IDXGIFactory6::EnumAdapterByGpuPreference(HIGH_PERFORMANCE)` so
+/// Windows per-app GPU settings and discrete/eGPU devices take priority, with
+/// fallback to the non-software adapter with the most dedicated VRAM.
+fn best_adapter() -> Option<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter queries and null-device FL 12.0 capability probes.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        if let Ok(factory6) = factory.cast::<IDXGIFactory6>() {
+            let mut i = 0u32;
+            while let Ok(adapter) = factory6
+                .EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            {
+                i += 1;
+                if let Ok(desc) = adapter.GetDesc1()
+                    && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
+                    && supports_fl12(&adapter)
+                {
+                    return Some(adapter);
+                }
+            }
+        }
+        let mut best: Option<IDXGIAdapter1> = None;
+        let mut max_vram = 0usize;
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            if let Ok(desc) = adapter.GetDesc1()
+                && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
+                && desc.DedicatedVideoMemory > max_vram
+                && supports_fl12(&adapter)
+            {
+                max_vram = desc.DedicatedVideoMemory;
+                best = Some(adapter);
+            }
+        }
+        best
     }
 }
 
