@@ -29,7 +29,7 @@ pub(crate) struct HostHeap {
     title: u32,
     /// Where the title's slots lie, in a view heap of a host that caps
     /// them; elsewhere title slot `i` is host slot `i`.
-    blocks: Option<Blocks>,
+    blocks: Option<std::sync::Arc<Blocks>>,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
     /// where the host takes them (also in a capped heap, [`capped_layout`]),
     /// else [`MIN_DYNAMIC`].
@@ -200,6 +200,8 @@ struct BlockMap {
     /// (a bit per title slot).
     views: Vec<u32>,
     held: Vec<u64>,
+    /// Recorded tables that may still read each title block.
+    readers: Vec<usize>,
     /// The most host blocks taken at once so far (logged as it grows).
     peak: usize,
 }
@@ -227,7 +229,35 @@ impl BlockMap {
     }
 }
 
+/// Retains the physical mapping for one table's title blocks while the
+/// recorded list can still read them.
+pub(crate) struct ViewBlockHold {
+    blocks: std::sync::Arc<Blocks>,
+    from: usize,
+    to: usize,
+}
+
+impl Drop for ViewBlockHold {
+    fn drop(&mut self) {
+        let mut map = self.blocks.map.lock().unwrap_or_else(|e| e.into_inner());
+        for block in self.from..=self.to {
+            map.readers[block] -= 1;
+            self.blocks.release_empty(&mut map, block);
+        }
+    }
+}
+
 impl Blocks {
+    fn release_empty(&self, map: &mut BlockMap, block: usize) {
+        let host = map.host[block];
+        if host == NONE || map.views[block] != 0 || map.readers[block] != 0 {
+            return;
+        }
+        self.write(block, self.null);
+        map.host[block] = NONE;
+        map.taken[host as usize] = false;
+    }
+
     /// Title block `block` now starts at host slot `first`.
     fn write(&self, block: usize, first: u32) {
         // SAFETY: a dword of the mapped table, which has one for each of
@@ -327,7 +357,7 @@ impl HostHeap {
                 // SAFETY: a dword of the mapped table, which has `entries`.
                 unsafe { data.cast::<u32>().add(block as usize).write_volatile(first) };
             }
-            blocks = Some(Blocks {
+            blocks = Some(std::sync::Arc::new(Blocks {
                 table: (table, data as usize),
                 null,
                 sparse,
@@ -336,9 +366,10 @@ impl HostHeap {
                     taken: vec![!sparse; host_blocks as usize],
                     views: vec![0; wanted as usize],
                     held: vec![0; if sparse { count.div_ceil(64) as usize } else { 0 }],
+                    readers: vec![0; if sparse { wanted as usize } else { 0 }],
                     peak: 0,
                 }),
-            });
+            }));
             match make(views) {
                 Ok(heap) => (heap, null + BLOCK, dynamic),
                 Err(e) => {
@@ -634,31 +665,38 @@ impl HostHeap {
             map.held[word] &= !bit;
             map.views[block] -= 1;
         }
-        let host = map.host[block];
-        if map.views[block] == 0 && host != NONE {
-            // Its slots are null by now, each made so when its view went.
-            blocks.write(block, blocks.null);
-            map.host[block] = NONE;
-            map.taken[host as usize] = false;
-        }
+        blocks.release_empty(&mut map, block);
     }
 
-    /// The host slot of title slot `first` if the title slots from it to
-    /// `last` (a table's entries) have host slots in one run, in order: a
-    /// shader given the first reads each at its place.
-    pub(crate) fn run(&self, first: u32, last: u32) -> Option<u32> {
-        let at = self.slot(first)?;
-        let Some(blocks) = self.blocks.as_ref().filter(|b| b.sparse) else {
-            return (self.slot(last)? >= at).then_some(at);
-        };
+    /// A run a recorded table may read. The optional hold keeps sparse
+    /// blocks assigned to that title range while the list can still run.
+    pub(crate) fn retain_run(&self, first: u32, last: u32) -> Option<(u32, Option<ViewBlockHold>)> {
         if last < first || last >= self.title {
             return None;
         }
-        let map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(blocks) = self.blocks.as_ref().filter(|blocks| blocks.sparse) else {
+            self.slot(last)?;
+            return Some((self.slot(first)?, None));
+        };
+        let mut map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
         let (from, to) = ((first / BLOCK) as usize, (last / BLOCK) as usize);
-        (from..=to)
-            .all(|b| map.host[from] != NONE && map.host[b] == map.host[from] + (b - from) as u32)
-            .then_some(at)
+        let host = map.host[from];
+        if host == NONE || !(from..=to).all(|b| map.host[b] == host + (b - from) as u32) {
+            return None;
+        }
+        for readers in &mut map.readers[from..=to] {
+            *readers += 1;
+        }
+        Some((host * BLOCK + first % BLOCK, Some(ViewBlockHold {
+            blocks: blocks.clone(),
+            from,
+            to,
+        })))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run(&self, first: u32, last: u32) -> Option<u32> {
+        self.retain_run(first, last).map(|(slot, _)| slot)
     }
 
     /// The view-block table, for root SRV `VIEW_BLOCKS`: every view heap of
