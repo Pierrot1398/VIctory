@@ -64,6 +64,7 @@ mod tdr;
 mod texture;
 #[cfg(windows)]
 mod title_copy;
+mod tiles;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
