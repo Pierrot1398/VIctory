@@ -530,7 +530,7 @@ fn copy_overlapping_mips(
             }
             let to_loc = CopyLocation::subresource(to_raw, dst_sub);
             let from_loc = CopyLocation::subresource(from_raw, src_sub);
-            crate::texture::host_written_subresource(dst, dst_sub);
+            crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 format!("copy overlapping mip {guest_mip} ({src:?} sub {src_sub} -> {dst:?} sub {dst_sub})")
@@ -701,11 +701,7 @@ extern "system" fn copy_texture_region(
             from.resource = texture.as_raw().cast_const().cast();
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        if dst.kind != FOOTPRINT {
-            crate::texture::host_written_subresource(dst.resource, to_sub);
-        } else {
-            crate::texture::host_written(dst.resource);
-        }
+        crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         if dst.kind != FOOTPRINT {
@@ -808,7 +804,7 @@ extern "system" fn resolve(
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written_subresource(dst, dst_sub);
+        crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

@@ -18,7 +18,6 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -27,22 +26,8 @@ use crate::host::{HostList, host};
 use crate::object::This;
 use windows::core::Interface;
 
-/// Computes the automatic mip drop level (`0` or `1`) from the host adapter's
-/// dedicated video memory when `VICTORY_TEXTURE_MIP_DROP` is not explicitly set.
-pub(crate) fn auto_mip_drop_for_memory(vram_bytes: u64) -> u32 {
-    // 8.5 GiB covers 4 GB, 6 GB, and 8 GB GPUs (typically 7900–8200 MiB reported),
-    // leaving 10 GB+ / 12 GB+ GPUs at native mip resolution by default.
-    const LOW_VRAM_THRESHOLD: u64 = (8 * 1024 + 512) * 1024 * 1024;
-    if vram_bytes > 0 && vram_bytes <= LOW_VRAM_THRESHOLD {
-        1
-    } else {
-        0
-    }
-}
-
 /// Number of top texture mip levels to drop on pure sampled textures to save VRAM
-/// (`VICTORY_TEXTURE_MIP_DROP=0..=3`). Automatically defaults to `1` on GPUs
-/// with <= 8 GiB dedicated VRAM when unset; explicit `0..=3` overrides it.
+/// (`VICTORY_TEXTURE_MIP_DROP=0..=3`, default `0`).
 pub(crate) fn texture_mip_drop() -> u32 {
     static DROP: OnceLock<u32> = OnceLock::new();
     *DROP.get_or_init(|| {
@@ -53,16 +38,7 @@ pub(crate) fn texture_mip_drop() -> u32 {
             }
             return parsed;
         }
-        let vram = crate::host::device_memory();
-        let auto_drop = auto_mip_drop_for_memory(vram);
-        if auto_drop > 0 {
-            tracing::info!(
-                mip_drop = auto_drop,
-                vram_mb = vram / (1024 * 1024),
-                "auto-enabling VICTORY_TEXTURE_MIP_DROP=1 for <= 8 GB GPU"
-            );
-        }
-        auto_drop
+        0
     })
 }
 
@@ -121,106 +97,18 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-/// Subresource-level tracking of host GPU writes so a partial `CopyTextureRegion`
-/// or `ResolveSubresource` only suppresses title-memory uploads for the specific
-/// subresources written on the host, while preserving untouched upper mips.
-#[derive(Clone)]
-pub(crate) enum HostWritten {
-    Low(u128),
-    Many(HashSet<u32>),
-    All,
-}
-
-impl Default for HostWritten {
-    fn default() -> Self {
-        Self::Low(0)
-    }
-}
-
-impl HostWritten {
-    pub(crate) fn mark_subresource(&mut self, sub: u32) {
-        match self {
-            Self::All => {}
-            Self::Low(mask) => {
-                if sub < u128::BITS {
-                    *mask |= 1u128 << sub;
-                } else {
-                    let mut set = HashSet::new();
-                    for i in 0..u128::BITS {
-                        if (*mask & (1u128 << i)) != 0 {
-                            set.insert(i);
-                        }
-                    }
-                    set.insert(sub);
-                    *self = Self::Many(set);
-                }
-            }
-            Self::Many(set) => {
-                set.insert(sub);
-            }
-        }
-    }
-
-    pub(crate) fn mark_all(&mut self) {
-        *self = Self::All;
-    }
-
-    pub(crate) fn contains(&self, sub: u32) -> bool {
-        match self {
-            Self::All => true,
-            Self::Low(mask) => sub < u128::BITS && (*mask & (1u128 << sub)) != 0,
-            Self::Many(set) => set.contains(&sub),
-        }
-    }
-
-    pub(crate) fn all_written(&self, total_subresources: u32) -> bool {
-        match self {
-            Self::All => true,
-            Self::Low(mask) => {
-                if total_subresources == 0 {
-                    return false;
-                }
-                if total_subresources >= u128::BITS {
-                    (0..total_subresources).all(|i| self.contains(i))
-                } else {
-                    let all_bits = (1u128 << total_subresources) - 1;
-                    (*mask & all_bits) == all_bits
-                }
-            }
-            Self::Many(set) => total_subresources > 0 && (0..total_subresources).all(|i| set.contains(&i)),
-        }
-    }
-}
-
-/// A whole-resource host copy writes `resource`: every subresource now holds
-/// host contents, not title memory's.
+/// A host copy or resolve writes `resource`: its host texture's contents
+/// are the host's, not title memory's, which stays as it was.
 pub(crate) fn host_written(resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
         copy.host_written
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .mark_all();
-    }
-}
-
-/// A host copy or resolve writes one subresource of `resource`, keeping
-/// untouched subresources eligible for title-memory upload.
-pub(crate) fn host_written_subresource(resource: This, sub: u32) {
-    if let Some(copy) = crate::resource::host_copy(resource) {
-        copy.host_written
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .mark_subresource(sub);
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
 fn is_host_written(resource: This) -> bool {
-    crate::resource::host_copy(resource).is_some_and(|c| {
-        c.host_written
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .all_written(c.host_subresources)
-    })
+    crate::resource::host_copy(resource)
+        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -373,27 +261,12 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     true
 }
 
-/// Records the copy of every non-host-written subresource of `staging` into
-/// `texture`, moving it to the copy destination state first.
+/// Records the copy of every subresource of `staging` into `texture`, moving
+/// it to the copy destination state first.
 fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging) {
-    let written = crate::resource::host_copy(resource).map(|copy| {
-        copy.host_written
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    });
-    if written
-        .as_ref()
-        .is_some_and(|w| w.all_written(staging.footprints.len() as u32))
-    {
-        return;
-    }
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     for (i, footprint) in staging.footprints.iter().enumerate() {
-        if written.as_ref().is_some_and(|w| w.contains(i as u32)) {
-            continue;
-        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -690,37 +563,5 @@ mod tests {
     #[test]
     fn texture_mip_drop_runs_without_panic() {
         let _ = texture_mip_drop();
-    }
-
-    #[test]
-    fn auto_mip_drop_threshold_selects_low_vram_gpus() {
-        assert_eq!(auto_mip_drop_for_memory(0), 0);
-        assert_eq!(auto_mip_drop_for_memory(128 << 20), 1); // 128 MiB iGPU
-        assert_eq!(auto_mip_drop_for_memory(6 << 30), 1); // 6 GB RTX 3050
-        assert_eq!(auto_mip_drop_for_memory(8_273_264_640), 1); // 8 GB RTX 5070 Laptop
-        assert_eq!(auto_mip_drop_for_memory(12 << 30), 0); // 12 GB RTX 4070 SUPER
-        assert_eq!(auto_mip_drop_for_memory(16 << 30), 0); // 16 GB RX 9060 XT
-    }
-
-    #[test]
-    fn host_written_tracks_subresources_and_many_promotion() {
-        let mut written = HostWritten::default();
-        written.mark_subresource(2);
-        written.mark_subresource(5);
-        assert!(!written.contains(0));
-        assert!(written.contains(2));
-        assert!(written.contains(5));
-        assert!(!written.all_written(6));
-
-        // Promotion past u128::BITS keeps earlier subresource bits intact.
-        written.mark_subresource(200);
-        assert!(written.contains(2));
-        assert!(written.contains(5));
-        assert!(written.contains(200));
-        assert!(!written.contains(1));
-
-        written.mark_all();
-        assert!(written.contains(0));
-        assert!(written.all_written(256));
     }
 }

@@ -803,11 +803,9 @@ pub(crate) struct HostTexture {
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
     pub(crate) castable: Vec<u32>,
-    /// Subresource-level tracking of host copies/resolves so untouched mips
-    /// remain eligible for title-memory upload.
-    pub(crate) host_written: std::sync::Mutex<crate::texture::HostWritten>,
-    /// Total subresources on the host texture (`mips * slices`).
-    pub(crate) host_subresources: u32,
+    /// A host copy or resolve wrote it: its contents are the host's, not
+    /// title memory's (`crate::texture`).
+    pub(crate) host_written: std::sync::atomic::AtomicBool,
     /// Number of mip levels the console requested (`mip_count(desc)`).
     pub(crate) title_mips: u16,
     /// Number of top console mips omitted when creating `texture`.
@@ -831,14 +829,8 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         // SAFETY: plain queries on a live resource.
         let td = unsafe { texture.GetDesc() };
-        let host_subresources = if td.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-            u32::from(td.MipLevels)
-        } else {
-            u32::from(td.MipLevels) * u32::from(td.DepthOrArraySize).max(1)
-        };
         let bytes = crate::host::host().map_or(0, |h| {
             // SAFETY: plain query on a live resource.
             unsafe { h.device.GetResourceAllocationInfo(0, &[td]) }.SizeInBytes
@@ -849,8 +841,7 @@ impl HostTexture {
             texture,
             state: state.into(),
             castable,
-            host_written: std::sync::Mutex::default(),
-            host_subresources,
+            host_written: false.into(),
             title_mips: td.MipLevels,
             mip_drop: 0,
             staging: std::sync::Mutex::new(None),
@@ -1091,8 +1082,7 @@ pub(crate) fn compute_mip_drop_explicit(desc: &ResourceDesc, drop: u32, min_size
     {
         return 0;
     }
-    // Exclude non-power-of-two (NPOT) textures: display artwork, loading screens,
-    // video frames, and UI presentation surfaces (e.g. 1920x1080, 1280x720, 2560x1440).
+    // Exclude non-power-of-two dimensions so aspect ratios and exact pixel sizes stay intact.
     // These are 2D presentation assets whose titles copy only subresource 0;
     // dropping them causes flat-colour loading screens while saving negligible VRAM (<10 MB).
     // In contrast, 3D world streaming textures in RAGE are strictly power-of-two.

@@ -1150,6 +1150,11 @@ fn adjust_srv_window(
 
 /// Adjusts an SRV's `MostDetailedMip`, `MipLevels`, and `ResourceMinLODClamp`
 /// to map guest mip indices onto a mip-dropped host texture.
+///
+/// Only the SRV mip window is shifted; shader-side `image_get_resinfo` reports
+/// the smaller host dimensions (`width >> drop`, `height >> drop`), and D3D12
+/// out-of-bounds `image_load` / `image_load_mip` texel reads return `0` without
+/// faulting.
 fn adjust_srv_for_dropped_mips(
     desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
     drop: u32,
