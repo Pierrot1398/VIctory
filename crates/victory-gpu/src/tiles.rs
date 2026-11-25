@@ -604,10 +604,12 @@ mod tests {
         assert!(tiled.give(&texture, 1));
         assert_eq!(tiled.without(0xfff), 0xffe);
         assert_eq!(tiled.given_bytes(), 32 * TILE);
-        // The last level is packed with the other small ones.
+        // The last level: packed with the other small ones on most hosts
+        // (giving it gives them all), its own standard level where the
+        // host packs nothing (WARP).
         assert!(tiled.give(&texture, 1 << 11));
         let packed_from = tiled.standard.len() as u32;
-        assert_eq!(tiled.without(0xfff), 0xffe & ((1 << packed_from) - 1));
+        assert_eq!(tiled.without(0xfff), 0xffe & !(1 << 11) & ((1 << packed_from) - 1));
         // Already given: nothing more is taken.
         let bytes = tiled.given_bytes();
         assert!(tiled.give(&texture, 1 | (1 << 11)));
