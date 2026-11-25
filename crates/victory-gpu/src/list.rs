@@ -452,6 +452,20 @@ extern "system" fn copy_buffer_region(
 }
 
 #[cfg(windows)]
+fn compatible_mip_drop_copy(
+    a_fmt: u32,
+    b_fmt: u32,
+    a_dim: i32,
+    b_dim: i32,
+    a_samples: u32,
+    b_samples: u32,
+) -> bool {
+    crate::resource::family(a_fmt) == crate::resource::family(b_fmt)
+        && a_dim == b_dim
+        && a_samples == b_samples
+}
+
+#[cfg(windows)]
 /// Copies surviving overlapping subresources when two textures have different
 /// `mip_drop` counts, marking only the actually written host subresources.
 fn copy_overlapping_mips(
@@ -467,8 +481,14 @@ fn copy_overlapping_mips(
     use windows::core::Interface;
     // SAFETY: live resources.
     let (a, b) = unsafe { (to.GetDesc(), from.GetDesc()) };
-    if a.Format != b.Format || a.Dimension != b.Dimension || a.SampleDesc.Count != b.SampleDesc.Count
-    {
+    if !compatible_mip_drop_copy(
+        a.Format.0 as u32,
+        b.Format.0 as u32,
+        a.Dimension.0,
+        b.Dimension.0,
+        a.SampleDesc.Count,
+        b.SampleDesc.Count,
+    ) {
         tracing::debug!(
             ?dst,
             ?src,
@@ -1872,5 +1892,15 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_overlapping_mips_allows_same_format_family() {
+        // R8G8B8A8_UNORM (28) -> R8G8B8A8_UNORM_SRGB (29) share typeless family 27.
+        assert!(compatible_mip_drop_copy(28, 29, 3, 3, 1, 1));
+        assert!(!compatible_mip_drop_copy(28, 10, 3, 3, 1, 1));
+        assert!(!compatible_mip_drop_copy(28, 29, 3, 4, 1, 1));
+        assert!(!compatible_mip_drop_copy(28, 29, 3, 3, 4, 1));
     }
 }
