@@ -348,6 +348,13 @@ fn wave_lanes_unsupported(
         }
         return wave64_stage && host_max < 64 && req_max > host_max;
     }
+    // A console wave64 compute program without a declared wave size is one
+    // the translator found reads no lane of another half (#233): it runs per
+    // lane at any wave size. Mesh programs have no such analysis, and
+    // `VICTORY_WAVE64_STRICT=1` refuses those compute programs as well.
+    if stage == "compute" && !crate::switch::on("VICTORY_WAVE64_STRICT") {
+        return false;
+    }
     wave64_stage && host_max < 64
 }
 
@@ -1038,11 +1045,13 @@ mod tests {
             (4, 4)
         ));
 
-        // Console wave64 compute with no PSV0 wave-lane range (or an upper
-        // bound wider than the host) is refused on <64-lane hosts, and allowed
-        // on 64-lane hosts; console wave32 compute without PSV0 runs everywhere.
-        assert!(wave_lanes_unsupported("compute", true, None, (32, 32)));
-        assert!(wave_lanes_unsupported("compute", true, None, (4, 4)));
+        // Console wave64 compute with no PSV0 wave-lane range reads no lane of
+        // another half (the translator declares a wave size where it does,
+        // #233): it runs on any host. One whose upper bound is wider than the
+        // host is refused on <64-lane hosts; console wave32 compute without
+        // PSV0 runs everywhere.
+        assert!(!wave_lanes_unsupported("compute", true, None, (32, 32)));
+        assert!(!wave_lanes_unsupported("compute", true, None, (4, 4)));
         assert!(wave_lanes_unsupported(
             "compute",
             true,
@@ -1079,10 +1088,13 @@ mod tests {
         assert!(wave64_on_32.contains("[32, 32]"));
         assert!(!wave64_on_32.contains("64-lane waves"));
 
-        let unsized_on_32 = wave_lanes_refusal("compute", true, None, (32, 32)).expect("refused");
+        // Unsized wave64 compute reads no other half's lanes and is kept
+        // (#233); unsized wave64 mesh is still refused.
+        assert!(wave_lanes_refusal("compute", true, None, (32, 32)).is_none());
+        let unsized_mesh_on_32 = wave_lanes_refusal("mesh", true, None, (32, 32)).expect("refused");
         assert_eq!(
-            unsized_on_32,
-            "a shader requiring 64-lane waves, on a host without them"
+            unsized_mesh_on_32,
+            "a mesh program written for 64-lane waves, on a host without them"
         );
     }
 
