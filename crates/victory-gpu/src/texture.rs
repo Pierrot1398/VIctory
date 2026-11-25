@@ -18,13 +18,42 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
 use windows::core::Interface;
+
+/// Number of top texture mip levels to drop on pure sampled textures to save VRAM
+/// (`VICTORY_TEXTURE_MIP_DROP=0..=3`, default `0`).
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: OnceLock<u32> = OnceLock::new();
+    *DROP.get_or_init(|| {
+        if let Ok(val) = std::env::var("VICTORY_TEXTURE_MIP_DROP") {
+            let parsed = val.trim().parse::<u32>().unwrap_or(0).min(3);
+            if parsed > 0 {
+                tracing::info!(mip_drop = parsed, "texture mip drop enabled");
+            }
+            return parsed;
+        }
+        0
+    })
+}
+
+/// Minimum width and height a texture must have to qualify for mip dropping
+/// (`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`, default `1024`).
+pub(crate) fn texture_mip_drop_min_size() -> u64 {
+    static MIN_SIZE: OnceLock<u64> = OnceLock::new();
+    *MIN_SIZE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+    })
+}
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -43,8 +72,10 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Host mips per array slice.
     mips: u32,
+    /// Number of top console mips dropped in the host texture.
+    mip_drop: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -70,13 +101,14 @@ unsafe impl Sync for Staging {}
 /// are the host's, not title memory's, which stays as it was.
 pub(crate) fn host_written(resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
+        copy.host_written
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
 fn is_host_written(resource: This) -> bool {
     crate::resource::host_copy(resource)
-        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
+        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -229,8 +261,8 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     true
 }
 
-/// Records the copy of every subresource of `staging` into `texture`,
-/// moving it to the copy destination state first.
+/// Records the copy of every subresource of `staging` into `texture`, moving
+/// it to the copy destination state first.
 fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging) {
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
@@ -351,7 +383,8 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let (host_mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let console_mip = host_mip + self.mip_drop;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
@@ -361,11 +394,15 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+            if let Err(e) = self.layout.detile(
+                tiled,
+                console_mip,
+                slice,
+                linear,
+                pitch,
+                pitch * rows as usize,
+            ) {
+                tracing::warn!(?e, console_mip, slice, "texture not detiled");
                 return;
             }
         }
@@ -437,6 +474,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let mip_drop = u32::from(copy.mip_drop);
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -465,7 +503,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, mip_drop, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
     let s = Arc::new(Staging {
         buffer,
@@ -475,6 +513,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        mip_drop,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
@@ -519,5 +558,10 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn texture_mip_drop_runs_without_panic() {
+        let _ = texture_mip_drop();
     }
 }
