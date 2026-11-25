@@ -233,6 +233,13 @@ pub(crate) fn pc_format(format: u32) -> u32 {
         118 => 45,
         119 => 46,
         120 => 47,
+        // `B4G4R4A4_UNORM`: NVIDIA reports it as a render target and then
+        // refuses the view, which D3D12 answers by removing the device (#1952,
+        // the title's 2560x1440 target). `B5G5R5A1_UNORM` is the same two
+        // bytes per texel, so the ladder and the copies keep their sizes; the
+        // colours are reinterpreted (4-4-4-4 read as 5-5-5-1), which is a
+        // shifted picture rather than none.
+        115 => 86,
         other => other,
     }
 }
@@ -1896,6 +1903,27 @@ mod tests {
         }
     }
 
+    /// The console's 2-byte packed colour formats have no PC render target on
+    /// NVIDIA: `B4G4R4A4_UNORM` is refused on creation and takes the device
+    /// with it (#1952). It stands in as `B5G5R5A1_UNORM`, which is the same
+    /// two bytes per texel - the sizes the ladder and the copies rely on - and
+    /// which the host does make a target of. The colours differ; that is the
+    /// cost, and it is a picture rather than none.
+    #[test]
+    fn a_packed_four_bit_target_stands_in_for_one_the_host_refuses() {
+        const B4G4R4A4_UNORM: u32 = 115;
+        const B5G5R5A1_UNORM: u32 = 86;
+        let stand_in = pc_format(B4G4R4A4_UNORM);
+        assert_eq!(stand_in, B5G5R5A1_UNORM);
+        assert_eq!(
+            element(B4G4R4A4_UNORM),
+            element(B5G5R5A1_UNORM),
+            "the stand-in keeps the element size, so no ladder step or copy changes"
+        );
+        // And the formats that answer for themselves still do.
+        assert_eq!(pc_format(28), 28);
+        assert_eq!(pc_format(118), 45);
+    }
     fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {
         ResourceDesc {
             dimension: 3,
