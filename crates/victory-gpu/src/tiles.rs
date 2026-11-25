@@ -619,6 +619,10 @@ mod tests {
         assert!(tiled.whole());
         assert_eq!(tiled.without(0xfff), 0);
         assert_eq!(tiled.given_bytes(), tiled.full);
+        // The mappings above are queued, not done: an empty submission waits
+        // for them before the heaps go back (in the title, the list that
+        // used the texture holds it past them).
+        host.execute(&[]);
         let heaps_before = STATS[3].load(Ordering::Relaxed);
         drop(tiled);
         assert!(STATS[3].load(Ordering::Relaxed) <= heaps_before);
